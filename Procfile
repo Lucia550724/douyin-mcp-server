@@ -1,1 +1,1 @@
-web: python run_sse.py
+web: python web/app.py

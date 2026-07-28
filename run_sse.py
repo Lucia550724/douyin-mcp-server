@@ -10,5 +10,5 @@ from douyin_mcp_server.server import mcp
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    print(f"🚀 启动抖音 MCP Server (SSE模式): http://0.0.0.0:{port}")
-    mcp.run(transport="sse", port=port)
+    print(f"🚀 启动抖音 MCP Server (SSE模式) on port {port}")
+    mcp.run(transport="sse")

@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Railway 部署入口 - FastAPI 挂载 MCP Server"""
+"""Railway 部署入口 - 同时提供 WebUI 和 MCP Server"""
 import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent / "douyin-video" / "scripts"))
-
-from douyin_mcp_server.server import mcp
 from fastapi import FastAPI
 import uvicorn
+
+from mcp_fastmcp import mcp
 
 app = FastAPI(title="抖音 MCP Server")
 
@@ -16,7 +12,7 @@ app = FastAPI(title="抖音 MCP Server")
 async def root():
     return {"status": "ok", "message": "Douyin MCP Server is running"}
 
-# 用 http_app() 支持 Streamable HTTP 协议
+# 挂载 fastmcp 的 ASGI 应用到 /mcp (Streamable HTTP)
 app.mount("/mcp", mcp.http_app())
 
 if __name__ == "__main__":

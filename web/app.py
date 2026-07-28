@@ -175,9 +175,9 @@ async def download_video(video_id: str, filename: str = "video.mp4"):
 
 def main():
     """启动服务"""
-    host = os.getenv("HOST", "127.0.0.1")
+    host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8080"))
-    print(f"🚀 启动文案提取器 WebUI: http://localhost:{port}")
+    print(f"🚀 启动文案提取器 WebUI: http://0.0.0.0:{port}")
     print(f"📝 API_KEY 配置状态: {'已配置' if os.getenv('API_KEY') else '未配置'}")
     uvicorn.run(app, host=host, port=port)
 

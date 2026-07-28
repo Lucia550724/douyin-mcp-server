@@ -29,27 +29,27 @@ import requests
 # 导入抖音处理模块
 from douyin_downloader import get_video_info, extract_text, HEADERS
 
+# ── 魔搭 MCP 保活配置 ──
+MCP_KEEPALIVE_URL = os.getenv("MCP_KEEPALIVE_URL", "")
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "300"))
+_keepalive_task = None
+
 app = FastAPI(title="抖音文案提取器", version="1.0.0")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 
 class VideoRequest(BaseModel):
-    """视频请求模型"""
     url: str
-    api_key: str = ""  # 可选，从前端传入
-
+    api_key: str = ""
 
 class VideoInfoResponse(BaseModel):
-    """视频信息响应"""
     success: bool
     video_id: str = ""
     title: str = ""
     download_url: str = ""
     error: str = ""
 
-
 class ExtractResponse(BaseModel):
-    """文案提取响应"""
     success: bool
     video_id: str = ""
     title: str = ""
@@ -57,84 +57,70 @@ class ExtractResponse(BaseModel):
     download_url: str = ""
     error: str = ""
 
+async def keep_mcp_alive():
+    """定时请求魔搭 MCP，防止 session 过期"""
+    if not MCP_KEEPALIVE_URL:
+        return
+    print(f"🔋 MCP 保活已启动: 每 {KEEPALIVE_INTERVAL}秒 请求一次")
+    while True:
+        try:
+            await asyncio.to_thread(requests.get, MCP_KEEPALIVE_URL, timeout=10)
+        except Exception:
+            pass
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+@app.on_event("startup")
+async def startup():
+    global _keepalive_task
+    if MCP_KEEPALIVE_URL:
+        _keepalive_task = asyncio.create_task(keep_mcp_alive())
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _keepalive_task
+    if _keepalive_task:
+        _keepalive_task.cancel()
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    """主页面"""
     return templates.TemplateResponse("index.html", {"request": request})
-
 
 @app.get("/api/health")
 async def health_check():
-    """健康检查"""
     api_key = os.getenv("API_KEY", "")
-    return {
-        "status": "ok",
-        "api_key_configured": bool(api_key)
-    }
-
+    return {"status": "ok", "api_key_configured": bool(api_key)}
 
 @app.post("/api/video/info", response_model=VideoInfoResponse)
 async def get_info(req: VideoRequest):
-    """获取视频信息（无需 API_KEY）"""
     try:
         info = await asyncio.to_thread(get_video_info, req.url)
-        return VideoInfoResponse(
-            success=True,
-            video_id=info["video_id"],
-            title=info["title"],
-            download_url=info["url"]
-        )
+        return VideoInfoResponse(success=True, video_id=info["video_id"], title=info["title"], download_url=info["url"])
     except Exception as e:
         return VideoInfoResponse(success=False, error=str(e))
 
-
 @app.post("/api/video/extract", response_model=ExtractResponse)
 async def extract_transcript(req: VideoRequest):
-    """提取视频文案（需要 API_KEY）"""
-    # 优先使用请求中的 API Key，其次使用环境变量
     api_key = req.api_key or os.getenv("API_KEY", "")
     if not api_key:
-        return ExtractResponse(
-            success=False,
-            error="请先配置 API Key"
-        )
-
+        return ExtractResponse(success=False, error="请先配置 API Key")
     try:
-        result = await asyncio.to_thread(
-            extract_text, req.url, api_key=api_key, show_progress=False
-        )
-        return ExtractResponse(
-            success=True,
-            video_id=result["video_info"]["video_id"],
-            title=result["video_info"]["title"],
-            text=result["text"],
-            download_url=result["video_info"]["url"]
-        )
+        result = await asyncio.to_thread(extract_text, req.url, api_key=api_key, show_progress=False)
+        return ExtractResponse(success=True, video_id=result["video_info"]["video_id"], title=result["video_info"]["title"], text=result["text"], download_url=result["video_info"]["url"])
     except Exception as e:
         return ExtractResponse(success=False, error=str(e))
 
-
 def _content_disposition(filename: str) -> str:
-    """构造安全的 Content-Disposition 头（ASCII 回退 + RFC 5987 编码）"""
     ascii_name = re.sub(r'[^A-Za-z0-9._-]', '_', filename) or "video.mp4"
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
 
-
 @app.get("/api/video/download")
 async def download_video(video_id: str, filename: str = "video.mp4"):
-    """代理下载视频（解决跨域和请求头问题）
-
-    只接受抖音视频 ID，由服务端自行解析出 CDN 链接，避免代理任意 URL。
-    """
     if not re.fullmatch(r'\d+', video_id):
         raise HTTPException(status_code=400, detail="无效的视频 ID")
-
     try:
         share_url = f"https://www.iesdouyin.com/share/video/{video_id}"
         info = await asyncio.to_thread(get_video_info, share_url)
-
-        # 完整的请求头，模拟浏览器访问
         download_headers = {
             'User-Agent': HEADERS['User-Agent'],
             'Referer': 'https://www.douyin.com/',
@@ -143,44 +129,28 @@ async def download_video(video_id: str, filename: str = "video.mp4"):
             'Accept-Encoding': 'identity',
             'Connection': 'keep-alive',
         }
-
-        response = await asyncio.to_thread(
-            requests.get, info["url"], headers=download_headers, stream=True, allow_redirects=True
-        )
+        response = await asyncio.to_thread(requests.get, info["url"], headers=download_headers, stream=True, allow_redirects=True)
         response.raise_for_status()
-
         content_length = response.headers.get("content-length", "")
-
         def iter_content():
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     yield chunk
-
-        headers = {
-            "Content-Disposition": _content_disposition(filename),
-        }
+        headers = {"Content-Disposition": _content_disposition(filename)}
         if content_length:
             headers["Content-Length"] = content_length
-
-        return StreamingResponse(
-            iter_content(),
-            media_type="video/mp4",
-            headers=headers
-        )
+        return StreamingResponse(iter_content(), media_type="video/mp4", headers=headers)
     except requests.exceptions.HTTPError as e:
         raise HTTPException(status_code=e.response.status_code, detail=f"下载失败: {e.response.status_code}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 def main():
-    """启动服务"""
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8080"))
     print(f"🚀 启动文案提取器 WebUI: http://0.0.0.0:{port}")
     print(f"📝 API_KEY 配置状态: {'已配置' if os.getenv('API_KEY') else '未配置'}")
     uvicorn.run(app, host=host, port=port)
-
 
 if __name__ == "__main__":
     main()

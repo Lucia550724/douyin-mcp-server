@@ -14,6 +14,10 @@ import requests
 
 mcp = FastMCP("Douyin MCP Server")
 
+# 硅基流动视觉模型 API
+VISION_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
+VISION_MODEL = "Qwen/Qwen2.5-VL-72B-Instruct"
+
 
 @mcp.tool()
 def parse_douyin_video_info(share_link: str) -> str:
@@ -64,7 +68,7 @@ def get_douyin_download_link(share_link: str) -> str:
 @mcp.tool()
 def extract_douyin_text(share_link: str) -> str:
     """
-    从抖音分享链接提取视频中的文本内容
+    从抖音分享链接提取视频中的文本内容（语音转文字）
 
     参数:
     - share_link: 抖音分享链接或包含链接的文本
@@ -72,13 +76,13 @@ def extract_douyin_text(share_link: str) -> str:
     返回:
     - 提取的文本内容
 
-    注意: 需要设置环境变量 API_KEY（硅基流动）或 DASHSCOPE_API_KEY（阿里云百炼）
+    注意: 需要设置环境变量 API_KEY（硅基流动）
     """
     api_key = os.getenv("API_KEY") or os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
         return json.dumps({
             "status": "error",
-            "error": "未设置 API_KEY 或 DASHSCOPE_API_KEY 环境变量"
+            "error": "未设置 API_KEY 环境变量"
         }, ensure_ascii=False)
     try:
         result = extract_text(share_link, api_key=api_key, show_progress=False)
@@ -96,7 +100,6 @@ def _rich_parse(share_text: str) -> dict:
     """
     更完整地解析抖音分享链接，提取图片、视频、封面等所有可用内容
     """
-    # 提取分享链接
     urls = re.findall(
         r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
         share_text
@@ -146,7 +149,6 @@ def _rich_parse(share_text: str) -> dict:
         "music": None,
     }
 
-    # 作者信息
     if "author" in item:
         author_info = item["author"]
         result["author"] = {
@@ -155,11 +157,9 @@ def _rich_parse(share_text: str) -> dict:
             "unique_id": author_info.get("unique_id", ""),
         }
 
-    # 封面图
     if "video" in item and "cover" in item["video"]:
         result["cover_url"] = item["video"]["cover"]["url_list"][0] if item["video"]["cover"].get("url_list") else None
 
-    # 图文作品的图片集
     if "images" in item:
         result["content_type"] = "image_post"
         result["images"] = [
@@ -169,13 +169,11 @@ def _rich_parse(share_text: str) -> dict:
         ]
         result["image_count"] = len(result["images"])
 
-    # 视频信息
     if "video" in item and "play_addr" in item["video"]:
         result["content_type"] = "video" if result["content_type"] == "video" else "mixed"
         video_url = item["video"]["play_addr"]["url_list"][0].replace("playwm", "play")
         result["video_url"] = video_url
 
-    # 音乐信息
     if "music" in item:
         music = item["music"]
         result["music"] = {
@@ -202,5 +200,97 @@ def extract_douyin_content(share_link: str) -> str:
     try:
         info = _rich_parse(share_link)
         return json.dumps(info, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
+
+def _ocr_image(image_url: str, api_key: str, prompt: str = "请提取这张图片中的所有文字内容，包括标题、正文、水印等") -> str:
+    """使用千问视觉模型提取图片中的文字"""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ],
+        "max_tokens": 4096
+    }
+    resp = requests.post(VISION_API_URL, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+@mcp.tool()
+def analyze_douyin_images(share_link: str) -> str:
+    """
+    从抖音链接提取所有图片，并用千问视觉模型自动识别图片中的文字内容
+    支持图文作品（多张图片）和视频封面
+
+    参数:
+    - share_link: 抖音分享链接或包含链接的文本
+
+    返回:
+    - 图片中的文字内容
+
+    注意: 需要设置环境变量 API_KEY（硅基流动 API Key）
+    """
+    api_key = os.getenv("API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        return json.dumps({
+            "status": "error",
+            "error": "未设置 API_KEY 环境变量（硅基流动 API Key）"
+        }, ensure_ascii=False)
+
+    try:
+        # 1. 解析链接获取图片
+        info = _rich_parse(share_link)
+        image_urls = []
+
+        # 收集所有可用的图片
+        if info.get("images"):
+            image_urls.extend(info["images"])
+        if info.get("cover_url"):
+            image_urls.append(info["cover_url"])
+
+        if not image_urls:
+            return json.dumps({
+                "status": "error",
+                "error": "未找到可识别的图片，该内容可能只有视频没有图片"
+            }, ensure_ascii=False)
+
+        results = {
+            "status": "success",
+            "video_id": info["video_id"],
+            "title": info["title"],
+            "author": info.get("author", {}).get("nickname", ""),
+            "content_type": info["content_type"],
+            "image_count": len(image_urls),
+            "extracted_text": []
+        }
+
+        # 2. 逐张图片进行OCR识别
+        for i, img_url in enumerate(image_urls):
+            text = _ocr_image(img_url, api_key)
+            results["extracted_text"].append({
+                "image_index": i + 1,
+                "image_url": img_url,
+                "text": text
+            })
+
+        # 如有背景音乐，也一并返回
+        if info.get("music"):
+            results["background_music"] = info["music"]["title"]
+
+        return json.dumps(results, ensure_ascii=False, indent=2)
+
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)

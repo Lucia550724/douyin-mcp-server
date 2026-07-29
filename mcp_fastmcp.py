@@ -6,6 +6,7 @@ import json
 import sys
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "douyin-video" / "scripts"))
@@ -16,144 +17,101 @@ import requests
 
 mcp = FastMCP("Douyin MCP Server")
 
-# 阿里云百炼视觉模型（qwen3-vl-plus 有免费额度）
 DASHSCOPE_VISION_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 DASHSCOPE_VISION_MODEL = "qwen3-vl-plus"
-
-# 硅基流动视觉模型（备用）
 SILICONFLOW_VISION_URL = "https://api.siliconflow.cn/v1/chat/completions"
 SILICONFLOW_VISION_MODEL = "Qwen/Qwen2.5-VL-72B-Instruct"
 
 
+def _find_bin(name: str) -> str:
+    """查找可执行文件路径"""
+    path = shutil.which(name)
+    if path:
+        return path
+    # 一些常见备用路径
+    for p in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/usr/local/opt/ffmpeg/bin"]:
+        candidate = Path(p) / name
+        if candidate.exists():
+            return str(candidate)
+    raise FileNotFoundError(f"{name} not found. Please install ffmpeg")
+
+
 @mcp.tool()
 def parse_douyin_video_info(share_link: str) -> str:
-    """解析抖音分享链接，获取视频基本信息"""
     try:
         info = get_video_info(share_link)
-        return json.dumps({
-            "video_id": info["video_id"],
-            "title": info["title"],
-            "download_url": info["url"],
-            "status": "success"
-        }, ensure_ascii=False)
+        return json.dumps({"video_id": info["video_id"], "title": info["title"], "download_url": info["url"], "status": "success"}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
 def get_douyin_download_link(share_link: str) -> str:
-    """获取抖音视频的无水印下载链接"""
     try:
         info = get_video_info(share_link)
-        return json.dumps({
-            "status": "success",
-            "video_id": info["video_id"],
-            "title": info["title"],
-            "download_url": info["url"]
-        }, ensure_ascii=False)
+        return json.dumps({"status": "success", "video_id": info["video_id"], "title": info["title"], "download_url": info["url"]}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
 def extract_douyin_text(share_link: str) -> str:
-    """从抖音分享链接提取视频中的文本内容（语音转文字）"""
     api_key = os.getenv("API_KEY") or os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
-        return json.dumps({"status": "error", "error": "未设置 API_KEY 或 DASHSCOPE_API_KEY 环境变量"}, ensure_ascii=False)
+        return json.dumps({"status": "error", "error": "未设置 API_KEY 或 DASHSCOPE_API_KEY"}, ensure_ascii=False)
     try:
         result = extract_text(share_link, api_key=api_key, show_progress=False)
-        return json.dumps({
-            "status": "success",
-            "video_id": result["video_info"]["video_id"],
-            "title": result["video_info"]["title"],
-            "text": result["text"]
-        }, ensure_ascii=False)
+        return json.dumps({"status": "success", "video_id": result["video_info"]["video_id"], "title": result["video_info"]["title"], "text": result["text"]}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
 def _rich_parse(share_text: str) -> dict:
-    """完整解析抖音分享链接，提取图片、视频、封面等内容"""
-    urls = re.findall(
-        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-        share_text
-    )
+    urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', share_text)
     if not urls:
         raise ValueError("未找到有效的分享链接")
-
     share_url = urls[0]
     share_response = requests.get(share_url, headers=HEADERS)
     video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
-    api_url = f"https://www.iesdouyin.com/share/video/{video_id}"
-
-    response = requests.get(api_url, headers=HEADERS)
+    response = requests.get(f"https://www.iesdouyin.com/share/video/{video_id}", headers=HEADERS)
     response.raise_for_status()
-
-    pattern = re.compile(
-        pattern=r"window\._ROUTER_DATA\s*=\s*(.*?)</script>",
-        flags=re.DOTALL,
-    )
-    match = pattern.search(response.text)
+    match = re.search(r"window\._ROUTER_DATA\s*=\s*(.*?)</script>", response.text, re.DOTALL)
     if not match:
         raise ValueError("从HTML中解析视频信息失败")
-
     json_data = json.loads(match.group(1).strip())
-    VIDEO_KEY = "video_(id)/page"
-    NOTE_KEY = "note_(id)/page"
-
-    if VIDEO_KEY in json_data["loaderData"]:
-        page_data = json_data["loaderData"][VIDEO_KEY]
-    elif NOTE_KEY in json_data["loaderData"]:
-        page_data = json_data["loaderData"][NOTE_KEY]
-    else:
+    ld = json_data["loaderData"]
+    key = "video_(id)/page" if "video_(id)/page" in ld else ("note_(id)/page" if "note_(id)/page" in ld else None)
+    if not key:
         raise Exception("无法从JSON中解析内容")
+    item = ld[key]["videoInfoRes"]["item_list"][0]
+    desc = re.sub(r'[\\/:*?"<>|]', '_', item.get("desc", "").strip() or f"douyin_{video_id}")
 
-    item_list = page_data.get("videoInfoRes", {}).get("item_list", [])
-    if not item_list:
-        raise Exception("item_list 为空")
-    item = item_list[0]
-    desc = item.get("desc", "").strip() or f"douyin_{video_id}"
-    desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
-
-    result = {
-        "video_id": video_id,
-        "title": desc,
-        "content_type": "video",
-        "images": [],
-        "video_url": None,
-        "cover_url": None,
-        "author": None,
-        "music": None,
-    }
+    result = {"video_id": video_id, "title": desc, "content_type": "video", "images": [], "video_url": None, "cover_url": None, "author": None, "music": None}
 
     if "author" in item:
-        author_info = item["author"]
-        avatar = None
-        if "avatar_thumb" in author_info:
-            avatar_list = author_info["avatar_thumb"].get("url_list")
-            if avatar_list:
-                avatar = avatar_list[0]
-        result["author"] = {
-            "nickname": author_info.get("nickname", ""),
-            "avatar": avatar,
-            "unique_id": author_info.get("unique_id", ""),
-        }
+        a = item["author"]
+        av = a.get("avatar_thumb", {}).get("url_list")
+        result["author"] = {"nickname": a.get("nickname", ""), "avatar": av[0] if av else None, "unique_id": a.get("unique_id", "")}
 
-    # 封面图
-    if "video" in item and isinstance(item["video"], dict) and "cover" in item["video"]:
-        cover = item["video"]["cover"]
-        if isinstance(cover, dict):
-            url_list = cover.get("url_list")
-            if url_list and isinstance(url_list, list):
-                result["cover_url"] = url_list[0]
+    if isinstance(item.get("video"), dict):
+        cv = item["video"].get("cover")
+        if isinstance(cv, dict):
+            cl = cv.get("url_list")
+            if cl:
+                result["cover_url"] = cl[0]
+        pa = item["video"].get("play_addr")
+        if isinstance(pa, dict):
+            vl = pa.get("url_list")
+            if vl:
+                result["video_url"] = vl[0].replace("playwm", "play")
+                if result["content_type"] == "image_post":
+                    result["content_type"] = "mixed"
 
-    # 图文作品的图片集
-    images_data = item.get("images")
-    if images_data and isinstance(images_data, list):
+    imgs = item.get("images")
+    if isinstance(imgs, list):
         result["content_type"] = "image_post"
         urls = []
-        for img in images_data:
+        for img in imgs:
             if isinstance(img, dict):
                 u = img.get("url_list", img.get("display_url", []))
                 if isinstance(u, list) and u:
@@ -164,159 +122,97 @@ def _rich_parse(share_text: str) -> dict:
             result["images"] = urls
             result["image_count"] = len(urls)
 
-    # 视频信息
-    if "video" in item and isinstance(item["video"], dict):
-        play_addr = item["video"].get("play_addr")
-        if play_addr and isinstance(play_addr, dict):
-            url_list = play_addr.get("url_list")
-            if url_list and isinstance(url_list, list):
-                video_url = url_list[0].replace("playwm", "play")
-                result["video_url"] = video_url
-                if result["content_type"] == "image_post":
-                    result["content_type"] = "mixed"
-
-    # 音乐信息
-    music = item.get("music")
-    if music and isinstance(music, dict):
-        cover_thumb = music.get("cover_thumb", {})
-        cover_url = None
-        if isinstance(cover_thumb, dict):
-            cl = cover_thumb.get("url_list")
-            if cl and isinstance(cl, list):
-                cover_url = cl[0]
-        result["music"] = {
-            "title": music.get("title", ""),
-            "author": music.get("author", ""),
-            "cover": cover_url,
-        }
+    mus = item.get("music")
+    if isinstance(mus, dict):
+        ct = mus.get("cover_thumb", {})
+        cl = ct.get("url_list") if isinstance(ct, dict) else None
+        result["music"] = {"title": mus.get("title", ""), "author": mus.get("author", ""), "cover": cl[0] if cl else None}
 
     return result
 
 
 @mcp.tool()
 def extract_douyin_content(share_link: str) -> str:
-    """从抖音分享链接提取完整内容（图片、封面、视频、文字、作者信息等）"""
     try:
-        info = _rich_parse(share_link)
-        return json.dumps(info, ensure_ascii=False, indent=2)
+        return json.dumps(_rich_parse(share_link), ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
 def _ocr_image(image_url: str, api_key: str, prompt: str = "请提取这张图片中的所有文字内容") -> str:
-    """使用视觉模型提取图片中的文字"""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    if os.getenv("DASHSCOPE_API_KEY"):
-        url, model = DASHSCOPE_VISION_URL, DASHSCOPE_VISION_MODEL
-    else:
-        url, model = SILICONFLOW_VISION_URL, SILICONFLOW_VISION_MODEL
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}, {"type": "text", "text": prompt}]}],
-        "max_tokens": 4096
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    url, model = (DASHSCOPE_VISION_URL, DASHSCOPE_VISION_MODEL) if os.getenv("DASHSCOPE_API_KEY") else (SILICONFLOW_VISION_URL, SILICONFLOW_VISION_MODEL)
+    resp = requests.post(url, headers=headers, json={"model": model, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}, {"type": "text", "text": prompt}]}], "max_tokens": 4096}, timeout=60)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
 
 @mcp.tool()
 def analyze_douyin_images(share_link: str) -> str:
-    """从抖音链接提取图片并用视觉模型识别文字内容"""
     api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("API_KEY")
     if not api_key:
-        return json.dumps({"status": "error", "error": "请设置 DASHSCOPE_API_KEY（推荐）或 API_KEY"}, ensure_ascii=False)
+        return json.dumps({"status": "error", "error": "请设置 DASHSCOPE_API_KEY"}, ensure_ascii=False)
     try:
         info = _rich_parse(share_link)
-        image_urls = []
-        if info.get("images"):
-            image_urls.extend(info["images"])
+        urls = list(info.get("images", []))
         if info.get("cover_url"):
-            image_urls.append(info["cover_url"])
-        if not image_urls:
+            urls.append(info["cover_url"])
+        if not urls:
             return json.dumps({"status": "error", "error": "未找到可识别的图片"}, ensure_ascii=False)
-
-        results = {
-            "status": "success", "video_id": info["video_id"],
-            "title": info["title"], "author": info.get("author", {}).get("nickname", ""),
-            "content_type": info["content_type"], "image_count": len(image_urls),
-            "extracted_text": []
-        }
-        for i, img_url in enumerate(image_urls):
-            results["extracted_text"].append({"image_index": i + 1, "text": _ocr_image(img_url, api_key)})
+        result = {"status": "success", "video_id": info["video_id"], "title": info["title"], "author": info.get("author", {}).get("nickname", ""), "content_type": info["content_type"], "image_count": len(urls), "extracted_text": []}
+        for i, u in enumerate(urls):
+            result["extracted_text"].append({"image_index": i + 1, "text": _ocr_image(u, api_key)})
         if info.get("music"):
-            results["background_music"] = info["music"]["title"]
-        return json.dumps(results, ensure_ascii=False, indent=2)
+            result["background_music"] = info["music"]["title"]
+        return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
 def _download_video(video_url: str) -> Path:
-    """下载视频到临时文件"""
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_path = Path(tmp.name)
-    resp = requests.get(video_url, headers=HEADERS, stream=True, timeout=30)
-    resp.raise_for_status()
-    with open(tmp_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
-    return tmp_path
+    p = Path(tmp.name)
+    r = requests.get(video_url, headers=HEADERS, stream=True, timeout=30)
+    r.raise_for_status()
+    with open(p, "wb") as f:
+        for c in r.iter_content(8192):
+            if c:
+                f.write(c)
+    return p
 
 
 def _extract_frames(video_path: Path, num_frames: int = 5) -> list[Path]:
-    """用 ffmpeg 从视频中提取关键帧"""
+    ffprobe = _find_bin("ffprobe")
+    ffmpeg = _find_bin("ffmpeg")
     frames = []
-    try:
-        dur_cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(video_path)
-        ]
-        duration = float(subprocess.check_output(dur_cmd, timeout=15).decode().strip())
-        if duration <= 0:
-            duration = 30
-        interval = max(duration / (num_frames + 1), 1)
-        for i in range(num_frames):
-            ts = interval * (i + 1)
-            frame_path = video_path.with_name(f"frame_{i}.jpg")
-            cmd = ["ffmpeg", "-y", "-ss", str(ts), "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(frame_path)]
-            subprocess.run(cmd, capture_output=True, timeout=30)
-            if frame_path.exists():
-                frames.append(frame_path)
-    except Exception as e:
-        raise Exception(f"抽帧失败: {e}")
+    dur = float(subprocess.check_output([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)], timeout=15).decode().strip())
+    if dur <= 0:
+        dur = 30
+    interval = max(dur / (num_frames + 1), 1)
+    for i in range(num_frames):
+        fp = video_path.with_name(f"frame_{i}.jpg")
+        subprocess.run([ffmpeg, "-y", "-ss", str(interval * (i + 1)), "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(fp)], capture_output=True, timeout=30)
+        if fp.exists():
+            frames.append(fp)
     if not frames:
         raise Exception("未能提取到任何视频帧")
     return frames
 
 
 def _image_to_base64(image_path: Path) -> str:
-    """将图片文件转为 base64 data URL"""
     import base64
     with open(image_path, "rb") as f:
-        data = base64.b64encode(f.read()).decode()
-    return f"data:image/jpeg;base64,{data}"
+        return f"data:image/jpeg;base64,{base64.b64encode(f.read()).decode()}"
 
 
 def _analyze_frames(frames: list[Path], api_key: str, prompt: str) -> str:
-    """将多帧图片发送给视觉模型分析"""
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    if os.getenv("DASHSCOPE_API_KEY"):
-        url, model = DASHSCOPE_VISION_URL, DASHSCOPE_VISION_MODEL
-    else:
-        url, model = SILICONFLOW_VISION_URL, SILICONFLOW_VISION_MODEL
-
+    url, model = (DASHSCOPE_VISION_URL, DASHSCOPE_VISION_MODEL) if os.getenv("DASHSCOPE_API_KEY") else (SILICONFLOW_VISION_URL, SILICONFLOW_VISION_MODEL)
     content = [{"type": "text", "text": prompt}]
-    for frame in frames:
-        b64 = _image_to_base64(frame)
-        content.append({"type": "image_url", "image_url": {"url": b64}})
-
-    payload = {"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 4096}
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    for f in frames:
+        content.append({"type": "image_url", "image_url": {"url": _image_to_base64(f)}})
+    r = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json={"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 4096}, timeout=120)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 
 @mcp.tool()
@@ -330,47 +226,25 @@ def analyze_douyin_video(share_link: str, num_frames: int = 5) -> str:
 
     返回:
     - 视频画面内容的文字描述
-
-    注意: 需要设置 DASHSCOPE_API_KEY（阿里云百炼，qwen3-vl-plus 免费额度）
     """
     api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("API_KEY")
     if not api_key:
-        return json.dumps({"status": "error", "error": "请设置 DASHSCOPE_API_KEY（推荐）或 API_KEY"}, ensure_ascii=False)
-
+        return json.dumps({"status": "error", "error": "请设置 DASHSCOPE_API_KEY"}, ensure_ascii=False)
     video_path = None
     try:
         info = _rich_parse(share_link)
-        video_url = info.get("video_url")
-        if not video_url:
-            return json.dumps({"status": "error", "error": "该内容没有视频可下载（可能是纯图文作品，请用 analyze_douyin_images）"}, ensure_ascii=False)
-
-        result = {
-            "status": "success",
-            "video_id": info["video_id"],
-            "title": info["title"],
-            "author": info.get("author", {}).get("nickname", ""),
-        }
-
-        video_path = _download_video(video_url)
+        vu = info.get("video_url")
+        if not vu:
+            return json.dumps({"status": "error", "error": "该内容没有视频可下载"}, ensure_ascii=False)
+        result = {"status": "success", "video_id": info["video_id"], "title": info["title"], "author": info.get("author", {}).get("nickname", "")}
+        video_path = _download_video(vu)
         frames = _extract_frames(video_path, num_frames)
         result["frames_extracted"] = len(frames)
-
-        prompt = (
-            "请分析这组视频截图，详细描述以下内容：\n"
-            "1. 画面中出现了什么场景和人物/动物\n"
-            "2. 视频中出现的任何文字内容（标题、字幕、贴纸文字、水印等）\n"
-            "3. 视频的整体风格、氛围和主题\n"
-            "4. 人物的动作、表情、互动\n"
-            "请用中文详细回答，像讲故事一样描述"
-        )
-        analysis = _analyze_frames(frames, api_key, prompt)
+        analysis = _analyze_frames(frames, api_key, "请分析这组视频截图，详细描述：1.画面中的场景和人物/动物 2.任何文字内容（标题、字幕、贴纸、水印）3.风格、氛围和主题 4.动作、表情、互动。请用中文详细描述")
         result["analysis"] = analysis
-
         if info.get("music"):
             result["background_music"] = info["music"]["title"]
-
         return json.dumps(result, ensure_ascii=False, indent=2)
-
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
     finally:

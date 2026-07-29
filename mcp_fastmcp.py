@@ -24,11 +24,9 @@ SILICONFLOW_VISION_MODEL = "Qwen/Qwen2.5-VL-72B-Instruct"
 
 
 def _find_bin(name: str) -> str:
-    """查找可执行文件路径"""
     path = shutil.which(name)
     if path:
         return path
-    # 一些常见备用路径
     for p in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/usr/local/opt/ffmpeg/bin"]:
         candidate = Path(p) / name
         if candidate.exists():
@@ -85,14 +83,11 @@ def _rich_parse(share_text: str) -> dict:
         raise Exception("无法从JSON中解析内容")
     item = ld[key]["videoInfoRes"]["item_list"][0]
     desc = re.sub(r'[\\/:*?"<>|]', '_', item.get("desc", "").strip() or f"douyin_{video_id}")
-
     result = {"video_id": video_id, "title": desc, "content_type": "video", "images": [], "video_url": None, "cover_url": None, "author": None, "music": None}
-
     if "author" in item:
         a = item["author"]
         av = a.get("avatar_thumb", {}).get("url_list")
         result["author"] = {"nickname": a.get("nickname", ""), "avatar": av[0] if av else None, "unique_id": a.get("unique_id", "")}
-
     if isinstance(item.get("video"), dict):
         cv = item["video"].get("cover")
         if isinstance(cv, dict):
@@ -106,7 +101,6 @@ def _rich_parse(share_text: str) -> dict:
                 result["video_url"] = vl[0].replace("playwm", "play")
                 if result["content_type"] == "image_post":
                     result["content_type"] = "mixed"
-
     imgs = item.get("images")
     if isinstance(imgs, list):
         result["content_type"] = "image_post"
@@ -121,13 +115,11 @@ def _rich_parse(share_text: str) -> dict:
         if urls:
             result["images"] = urls
             result["image_count"] = len(urls)
-
     mus = item.get("music")
     if isinstance(mus, dict):
         ct = mus.get("cover_thumb", {})
         cl = ct.get("url_list") if isinstance(ct, dict) else None
         result["music"] = {"title": mus.get("title", ""), "author": mus.get("author", ""), "cover": cl[0] if cl else None}
-
     return result
 
 
@@ -139,7 +131,16 @@ def extract_douyin_content(share_link: str) -> str:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
-def _ocr_image(image_url: str, api_key: str, prompt: str = "请提取这张图片中的所有文字内容") -> str:
+# 图文兼视觉描述 prompt：同时提取文字 + 描述画面
+IMAGE_ANALYZE_PROMPT = (
+    "请综合描述这张图片的完整内容，包括两个方面：\n"
+    "1. 【画面描述】图片中有什么物体、人物、场景、颜色、风格，整体的构图和氛围\n"
+    "2. 【文字提取】图片中出现的所有文字内容，包括标题、正文、贴纸、水印、品牌标识等\n"
+    "请用中文详细回答，先描述画面再给出文字内容"
+)
+
+
+def _analyze_image(image_url: str, api_key: str, prompt: str = IMAGE_ANALYZE_PROMPT) -> str:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     url, model = (DASHSCOPE_VISION_URL, DASHSCOPE_VISION_MODEL) if os.getenv("DASHSCOPE_API_KEY") else (SILICONFLOW_VISION_URL, SILICONFLOW_VISION_MODEL)
     resp = requests.post(url, headers=headers, json={"model": model, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}, {"type": "text", "text": prompt}]}], "max_tokens": 4096}, timeout=60)
@@ -149,6 +150,15 @@ def _ocr_image(image_url: str, api_key: str, prompt: str = "请提取这张图�
 
 @mcp.tool()
 def analyze_douyin_images(share_link: str) -> str:
+    """
+    分析抖音图文/视频封面中的图片内容，同时提取文字和描述画面
+
+    参数:
+    - share_link: 抖音分享链接
+
+    返回:
+    - 每张图片的画面描述 + 文字内容
+    """
     api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("API_KEY")
     if not api_key:
         return json.dumps({"status": "error", "error": "请设置 DASHSCOPE_API_KEY"}, ensure_ascii=False)
@@ -159,9 +169,9 @@ def analyze_douyin_images(share_link: str) -> str:
             urls.append(info["cover_url"])
         if not urls:
             return json.dumps({"status": "error", "error": "未找到可识别的图片"}, ensure_ascii=False)
-        result = {"status": "success", "video_id": info["video_id"], "title": info["title"], "author": info.get("author", {}).get("nickname", ""), "content_type": info["content_type"], "image_count": len(urls), "extracted_text": []}
+        result = {"status": "success", "video_id": info["video_id"], "title": info["title"], "author": info.get("author", {}).get("nickname", ""), "content_type": info["content_type"], "image_count": len(urls), "image_analysis": []}
         for i, u in enumerate(urls):
-            result["extracted_text"].append({"image_index": i + 1, "text": _ocr_image(u, api_key)})
+            result["image_analysis"].append({"image_index": i + 1, "content": _analyze_image(u, api_key)})
         if info.get("music"):
             result["background_music"] = info["music"]["title"]
         return json.dumps(result, ensure_ascii=False, indent=2)

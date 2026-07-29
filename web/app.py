@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-抖音视频文案提取器 WebUI
+抖音视频文案提取器 WebUI + MCP Streamable HTTP 端点
+
+同时提供:
+1. WebUI 界面 (用于手动操作和魔搭 MCP 保活)
+2. MCP Streamable HTTP 端点 at /mcp (橘瓣可直接连接，无需魔搭)
 
 启动方式:
     cd douyin-mcp-server
@@ -17,7 +21,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 # 添加项目路径
-sys.path.insert(0, str(Path(__file__).parent.parent / "douyin-video" / "scripts"))
+BASE_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(BASE_DIR / "douyin-video" / "scripts"))
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -29,13 +34,38 @@ import requests
 # 导入抖音处理模块
 from douyin_downloader import get_video_info, extract_text, HEADERS
 
+# ── 导入 MCP Server (用于挂载到 /mcp 端点) ──
+try:
+    from douyin_mcp_server.server import mcp as douyin_mcp
+    HAS_MCP = True
+except ImportError:
+    # 如果 douyin_mcp_server 不可用（比如直接运行 web/app.py 时），退而使用 mcp_fastmcp.py
+    sys.path.insert(0, str(BASE_DIR))
+    try:
+        from mcp_fastmcp import mcp as douyin_mcp
+        HAS_MCP = True
+    except ImportError:
+        HAS_MCP = False
+        print("⚠️ MCP 模块未找到，仅运行 WebUI 模式")
+
 # ── 魔搭 MCP 保活配置 ──
 MCP_KEEPALIVE_URL = os.getenv("MCP_KEEPALIVE_URL", "")
 KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "300"))
 _keepalive_task = None
 
-app = FastAPI(title="抖音文案提取器", version="1.0.0")
+app = FastAPI(title="抖音 MCP Server + WebUI", version="1.5.0")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
+
+# ── 挂载 MCP 工具到 /mcp 端点 (Streamable HTTP) ──
+if HAS_MCP:
+    try:
+        # FastMCP 的 http_app() 返回 ASGI 应用
+        mcp_app = douyin_mcp.http_app()
+        app.mount("/mcp", mcp_app)
+        print("✅ MCP Streamable HTTP 端点已挂载到 /mcp")
+        print(f"   橘瓣客户端可连接: https://douyin-mcp-server-production.up.railway.app/mcp")
+    except Exception as e:
+        print(f"⚠️ MCP 挂载失败: {e}")
 
 
 class VideoRequest(BaseModel):
@@ -57,6 +87,7 @@ class ExtractResponse(BaseModel):
     download_url: str = ""
     error: str = ""
 
+
 async def keep_mcp_alive():
     """定时请求魔搭 MCP，防止 session 过期"""
     if not MCP_KEEPALIVE_URL:
@@ -69,11 +100,13 @@ async def keep_mcp_alive():
             pass
         await asyncio.sleep(KEEPALIVE_INTERVAL)
 
+
 @app.on_event("startup")
 async def startup():
     global _keepalive_task
     if MCP_KEEPALIVE_URL:
         _keepalive_task = asyncio.create_task(keep_mcp_alive())
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -86,18 +119,31 @@ async def shutdown():
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+
 @app.get("/api/health")
 async def health_check():
     api_key = os.getenv("API_KEY", "")
-    return {"status": "ok", "api_key_configured": bool(api_key)}
+    return {
+        "status": "ok",
+        "api_key_configured": bool(api_key),
+        "mcp_endpoint": "/mcp",
+        "mcp_available": HAS_MCP
+    }
+
 
 @app.post("/api/video/info", response_model=VideoInfoResponse)
 async def get_info(req: VideoRequest):
     try:
         info = await asyncio.to_thread(get_video_info, req.url)
-        return VideoInfoResponse(success=True, video_id=info["video_id"], title=info["title"], download_url=info["url"])
+        return VideoInfoResponse(
+            success=True,
+            video_id=info["video_id"],
+            title=info["title"],
+            download_url=info["url"]
+        )
     except Exception as e:
         return VideoInfoResponse(success=False, error=str(e))
+
 
 @app.post("/api/video/extract", response_model=ExtractResponse)
 async def extract_transcript(req: VideoRequest):
@@ -105,14 +151,25 @@ async def extract_transcript(req: VideoRequest):
     if not api_key:
         return ExtractResponse(success=False, error="请先配置 API Key")
     try:
-        result = await asyncio.to_thread(extract_text, req.url, api_key=api_key, show_progress=False)
-        return ExtractResponse(success=True, video_id=result["video_info"]["video_id"], title=result["video_info"]["title"], text=result["text"], download_url=result["video_info"]["url"])
+        result = await asyncio.to_thread(
+            extract_text, req.url,
+            api_key=api_key, show_progress=False
+        )
+        return ExtractResponse(
+            success=True,
+            video_id=result["video_info"]["video_id"],
+            title=result["video_info"]["title"],
+            text=result["text"],
+            download_url=result["video_info"]["url"]
+        )
     except Exception as e:
         return ExtractResponse(success=False, error=str(e))
+
 
 def _content_disposition(filename: str) -> str:
     ascii_name = re.sub(r'[^A-Za-z0-9._-]', '_', filename) or "video.mp4"
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+
 
 @app.get("/api/video/download")
 async def download_video(video_id: str, filename: str = "video.mp4"):
@@ -129,28 +186,42 @@ async def download_video(video_id: str, filename: str = "video.mp4"):
             'Accept-Encoding': 'identity',
             'Connection': 'keep-alive',
         }
-        response = await asyncio.to_thread(requests.get, info["url"], headers=download_headers, stream=True, allow_redirects=True)
+        response = await asyncio.to_thread(
+            requests.get, info["url"],
+            headers=download_headers, stream=True, allow_redirects=True
+        )
         response.raise_for_status()
         content_length = response.headers.get("content-length", "")
+
         def iter_content():
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     yield chunk
+
         headers = {"Content-Disposition": _content_disposition(filename)}
         if content_length:
             headers["Content-Length"] = content_length
-        return StreamingResponse(iter_content(), media_type="video/mp4", headers=headers)
+        return StreamingResponse(
+            iter_content(), media_type="video/mp4", headers=headers
+        )
     except requests.exceptions.HTTPError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"下载失败: {e.response.status_code}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"下载失败: {e.response.status_code}"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 def main():
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8080"))
-    print(f"🚀 启动文案提取器 WebUI: http://0.0.0.0:{port}")
+    print(f"🚀 启动抖音 MCP + WebUI: http://0.0.0.0:{port}")
     print(f"📝 API_KEY 配置状态: {'已配置' if os.getenv('API_KEY') else '未配置'}")
+    print(f"🌐 WebUI: http://0.0.0.0:{port}/")
+    print(f"🔧 MCP 端点: http://0.0.0.0:{port}/mcp (Streamable HTTP)")
     uvicorn.run(app, host=host, port=port)
+
 
 if __name__ == "__main__":
     main()

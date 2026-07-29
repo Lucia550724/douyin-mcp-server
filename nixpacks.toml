@@ -3,6 +3,7 @@ nixPkgs = ["python3", "ffmpeg", "uv"]
 
 [phases.install]
 cmds = [
+  "apt-get update -qq && apt-get install -y -qq ffmpeg 2>/dev/null || true",
   "pip install -r requirements.txt"
 ]
 

@@ -231,13 +231,17 @@ output/
 
 ## 📝 更新日志
 
-### v1.4.1 (最新)
+### v1.5.0
+
+- 🔧 **MCP + WebUI 二合一** - 在 WebUI 上挂载 MCP Streamable HTTP 端点 (`/mcp`)，橘瓣等客户端可直接连接 Railway 直连，彻底绕开魔搭 SSE 会话过期问题
+
+### v1.4.1
 
 - 🔧 **MCP Server 修复** - `API_KEY` 现在正确对应硅基流动密钥，与文档一致；同时兼容旧版 `DASHSCOPE_API_KEY` 配置
 - ♻️ **恢复工具** - 恢复 `recognize_audio_file` / `recognize_audio_url` 工具及 `extract_douyin_text` 的 `context` 参数
 - 🛡️ **WebUI 安全加固** - 下载接口不再代理任意 URL，默认仅监听本机
 - ⚡ **WebUI 性能** - 提取文案不再阻塞其他请求
-- 📦 **依赖精简** - WebUI 依赖改为可选安装（`pip install "douyin-mcp-server[web]"`）
+- 📦 **依赖精简** - WebUI 依赖改为可选安装（`pip install \"douyin-mcp-server[web]\"`）
 
 ### v1.4.0
 
